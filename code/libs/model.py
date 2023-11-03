@@ -63,14 +63,28 @@ class FCOSClassificationHead(nn.Module):
 
         Without pertumation, the results will be a list of tensors in increasing
         depth order, i.e., output[0] will be the feature map with highest resolution
-        and output[-1] will the featuer map with lowest resolution. The list length is
+        and output[-1] will the feature map with lowest resolution. The list length is
         equal to the number of pyramid levels. Each tensor in the list will be
         of size N x C x H x W, storing the classification logits (scores).
 
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        cls_logits_list = list() # list to contain the classification logits for each FPN layer
+
+        for features in x:
+            cls_logits = self.conv(features)
+            cls_logits = self.cls_logits(cls_logits)
+
+            # Change output shape from (N, num_classes, H, W) to (N, H*W, num_classes)
+            N, K, H, W = cls_logits.shape
+            cls_logits = cls_logits.view(N, self.num_classes, H, W) # N, num_classes, H, W
+            cls_logits = cls_logits.permute(0, 2, 3, 1) # N, H, W, num_classes
+            cls_logits = cls_logits.reshape(N, -1, self.num_classes) # N, HW, num_classes
+
+            cls_logits_list.append(cls_logits)
+
+        return cls_logits_list # list of length num_fpn_heads with (N, HW, num_classes) logits for each level
 
 
 class FCOSRegressionHead(nn.Module):
@@ -131,8 +145,30 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        bbox_regression_list = list()
+        bbox_centerness_list = list()
 
+        for features in x:
+            bbox_feature = self.conv(features)
+            bbox_regression = self.bbox_reg(bbox_feature) # ReLU is already applied here!
+            bbox_centerness = self.bbox_ctrness(bbox_feature)
+
+            # Change bbox output shape from (N, 4, H, W) to (N, H*W, 4)
+            N, _, H, W = bbox_regression.shape
+            bbox_regression = bbox_regression.view(N, 4, H, W)
+            bbox_regression = bbox_regression.permute(0, 2, 3, 1) # N, H, W, 4
+            bbox_regression = bbox_regression.reshape(N, -1, 4) # N, HW, 4 
+            bbox_regression_list.append(bbox_regression)
+
+            # Change centerness output shape from (N, 1, H, W) to (N, H*W, 1)
+            N, _, H, W = bbox_centerness.shape
+            bbox_centerness = bbox_centerness.view(N, 1, H, W)
+            bbox_centerness = bbox_centerness.permute(0, 2, 3, 1) # N, H, W, 1
+            bbox_centerness = bbox_centerness.reshape(N, -1, 1) # N, HW, 1 
+            bbox_centerness_list.append(bbox_centerness)
+        
+        # Concatenate lists of bbox coords and centerness vals
+        return bbox_regression_list, bbox_centerness_list # lists of len num_fpn_heads, (N, HW, 4 OR 1) for each fpn level
 
 class FCOS(nn.Module):
     """
@@ -410,7 +446,94 @@ class FCOS(nn.Module):
     ]
     """
 
+
+
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        # points: list of possible points at each fpn layer: [(80, 80, 2), (40, 40, 2), (20, 20, 2), (10, 10, 2), (5, 5, 2)]
+        # strides: tensor of the different FPN strides [8, 16, 32, 64, 128]
+        # cls_logits: list of tensors: (N, HW_, num_classes) for each FPN layer: [[N, 6400, 20], [N, 1600, 20], [N, 400, 20], [N, 100, 20], [N, 25, 20]] = (N, 8525, num_classes)
+        # reg_outputs: list of tensors: (N, HW_, 4) for each FPN layer: [[N, 6400, 4], [N, 1600, 4], [N, 400, 4], [N, 100, 4], [N, 25, 4]] = (N, 8525, 4)
+        # ctr_logits: list of tensors: (N, HW_, 1) for each FPN layer: [[N, 6400, 1], [N, 1600, 1], [N, 400, 1], [N, 100, 1], [N, 25, 1]] = (N, 8525, 1)
+        # image_shapes: shapes of each of the input images [(640, 451), ... * N]
+
+        detections = list() # list of detections for each image
+
+        num_images = len(image_shapes)
+
+
+        for i in range(num_images):
+            # Get a list of all the bboxes/logits/center scores at each fpn level for ONE image
+            bbox_coords_per_image = [fpn_level_bboxes[i] for fpn_level_bboxes in reg_outputs]
+            cls_logits_per_image = [fpn_level_cls_logits[i] for fpn_level_cls_logits in cls_logits]
+            center_logits_per_image = [fpn_level_centerness[i] for fpn_level_centerness in ctr_logits]
+            image_shape = image_shapes[i]
+
+            # Lists that contain the predictions, scores, and bboxes for every detection in this image at the different fpn levels
+            final_image_bboxes_list = list()
+            final_image_confidence_scores_list = list()
+            final_image_classes_list = list()
+
+            for bbox_coords_in_fpn_level, cls_logits_in_fpn_level, center_logits_in_fpn_level, points_in_fpn_level, stride_in_fpn_level in zip(bbox_coords_per_image, cls_logits_per_image, center_logits_per_image, points, strides):
+                num_classes = cls_logits_in_fpn_level.shape[-1] # get the number of classes
+
+                # remove lowest scoring boxes, keep only topk scoring predictions
+                final_image_confidence_scores = torch.sqrt(torch.sigmoid(cls_logits_in_fpn_level) * torch.sigmoid(center_logits_in_fpn_level))
+                final_image_confidence_scores = final_image_confidence_scores.flatten() # flatten to 1D tensor to easily do thresholding
+
+                indexesToKeep = final_image_confidence_scores > self.score_thresh
+                final_image_confidence_scores = final_image_confidence_scores[indexesToKeep]
+
+                # keep only topk scoring predictions
+                topKIndexes = torch.where(indexesToKeep)[0] # indexes of every True value
+                # compute number of topk predictions to get, either there are enough high scoring candidates to get the max number (self.topk_candidates), or keep all the ones we have
+                num_topK = min(self.topk_candidates, topKIndexes.size(0)) 
+                final_image_confidence_scores, indexes = final_image_confidence_scores.topk(num_topK) # get the final topk scores and indexes for that image at that fpn level
+                topKIndexes = topKIndexes[indexes]
+                
+                # Get the final point indexes; de-flatten the indexes by dividing by the number of classes (undoes the class logits * center logits flatten operation above)
+                point_indexes = torch.div(topKIndexes, num_classes, rounding_mode="floor")
+
+                # Get the final labels: remainder of topkindexes will get you the class value (due to the flatten operation above)
+                classes_per_fpn_level = topKIndexes % num_classes
+
+                # Get the final boxes
+                box_offsets = bbox_coords_in_fpn_level[point_indexes]
+                box_points = points_in_fpn_level.reshape((-1, 2))[point_indexes] # get the associated centers for the topk scores: format (# point locations in this fpn level, 2)
+
+                center_x = box_points[...,1]
+                center_y = box_points[...,0]
+
+                l = torch.mul(box_offsets[...,0], stride_in_fpn_level) # need to multiply by correct stride!!
+                t = torch.mul(box_offsets[...,1], stride_in_fpn_level)
+                r = torch.mul(box_offsets[...,2], stride_in_fpn_level)
+                b = torch.mul(box_offsets[...,3], stride_in_fpn_level)
+
+                final_image_bboxes = torch.stack((center_x - l, center_y - t, center_x + r, center_y + b), dim=-1) # (# point locations in fpn level, 4)
+
+                # clip final bboxes to be within the image dimensions
+                box_dims = final_image_bboxes.dim()
+                boxes_x = final_image_bboxes[...,0::2]
+                boxes_y = final_image_bboxes[...,1::2]
+                final_image_bboxes = torch.stack((boxes_x.clamp(min=0, max=image_shape[1]), boxes_y.clamp(min=0, max=image_shape[0])), dim=box_dims).reshape(final_image_bboxes.shape)
+
+                # append computed bbox coords, labels, and scores to lists
+                final_image_bboxes_list.append(final_image_bboxes)
+                final_image_confidence_scores_list.append(final_image_confidence_scores)
+                final_image_classes_list.append(classes_per_fpn_level)
+
+
+            # Create final output tensors
+            final_bboxes = torch.cat(final_image_bboxes_list, dim=0)
+            final_scores = torch.cat(final_image_confidence_scores_list, dim=0)
+            final_classes = torch.cat(final_image_classes_list, dim=0)
+
+            # Do non-max suppression SEPARATELY FOR EACH CLASS
+            toKeep = batched_nms(final_bboxes, final_scores, final_classes, self.nms_thresh)
+
+            toKeep = toKeep[: self.detections_per_img] # keep the first __ number of detections
+            detections.append({"boxes": final_bboxes[toKeep], "scores": final_scores[toKeep], "labels": final_classes[toKeep] + 1})
+
         return detections
+    
