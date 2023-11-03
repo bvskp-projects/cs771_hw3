@@ -177,8 +177,8 @@ def evaluate(
                         boxes_labels,
                         boxes_colors,
                         width=2,
-                        font="FreeMono.ttf",
-                        font_size=16
+                        # font="FreeMono.ttf",
+                        # font_size=16
                     )
                     # save the results
                     image_id = int(target["image_id"].item())
