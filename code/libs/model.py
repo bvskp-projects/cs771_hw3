@@ -272,7 +272,8 @@ class FCOS(nn.Module):
         self.nms_thresh = test_cfg["nms_thresh"]
         self.detections_per_img = test_cfg["detections_per_img"]
         self.topk_candidates = test_cfg["topk_candidates"]
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(train_cfg.get("devices", ["cpu"])[0])
+
     """
     We will overwrite the train function. This allows us to always freeze
     all batchnorm layers in the backbone, as we won't have sufficient samples in
@@ -422,104 +423,104 @@ class FCOS(nn.Module):
         pos_samples = 0
         lambda_reg = 1
         for img, target in enumerate(targets):
-            boxes = target["boxes"]                                         # boxes -> (x1, y1, x2, y2) - torch.Size([1, 4])
-            labels = target["labels"]                                       # classes   - torch.Size([1])
-            areas = (boxes[:,2] - boxes[:,0]) * (boxes[:,3] - boxes[:,1])   # area -> (x2-x1) * (y2-y1) - torch.Size([1])
-            centers = (boxes[:,:2] + boxes[:, 2:]) / 2                      # center - torch.Size([1, 2])
-
+            boxes = target["boxes"]                                         # boxes -> (x1, y1, x2, y2) - torch.Size([n_box, 4])
+            labels = target["labels"]                                       # classes [0-19]  - torch.Size([n_box])
+            areas = (boxes[:,2] - boxes[:,0]) * (boxes[:,3] - boxes[:,1])   # area -> (x2-x1) * (y2-y1) - torch.Size([n_box])
+            centers = (boxes[:,:2] + boxes[:, 2:]) / 2                      # center - torch.Size([n_box, 2])
+            n_boxes = boxes.shape[0]                                        # no of boxes
             for l_points, l_stride, l_reg_range, l_cls_logits, l_reg_outputs, l_ctr_logits in \
                 zip(points, strides, reg_range, cls_logits, reg_outputs, ctr_logits):
 
-                l_cls_point = l_cls_logits[img]     # torch.Size([3136, 20])
-                l_reg_point = l_reg_outputs[img]    # torch.Size([3136, 4])
-                l_ctr_point = l_ctr_logits[img]     # torch.Size([3136, 1])
+                l_cls_point = l_cls_logits[img]     # torch.Size([W*H, 20])
+                l_reg_point = l_reg_outputs[img]    # torch.Size([W*H, 4])
+                l_ctr_point = l_ctr_logits[img]     # torch.Size([W*H, 1])
+                
+                height, width = l_points.shape[:2] 
+                center_xy_1 = centers - self.center_sampling_radius * l_stride  #torch.Size([n_box, 2])     
+                center_xy_2 = centers + self.center_sampling_radius * l_stride #torch.Size([n_box, 2])
+                center_target = torch.concat((center_xy_1, center_xy_2), dim=1) #torch.Size([n_box, 4])
 
-                width, height = l_points.shape[:2]  # 40, 56
+                repeated_points = l_points.unsqueeze(dim=0).repeat(n_boxes, 1, 1, 1)    #torch.Size([n_box, H, W, 2])
 
-                n_boxes = boxes.shape[0]            # no of boxes
+                repeated_subbox = center_target.view(-1,1,1,4).repeat(1, height, width, 1)  #torch.Size([n_box, H, W, 4])
 
-                center_xy_1 = centers - self.center_sampling_radius * l_stride  #torch.Size([1, 2])
-                center_xy_2 = centers + self.center_sampling_radius * l_stride  #torch.Size([1, 2])
-                center_target = torch.concat((center_xy_1, center_xy_2), dim=1) #torch.Size([1, 4])
-
-                repeated_points = l_points.unsqueeze(dim=0).repeat(n_boxes, 1, 1, 1)    #torch.Size([1, 56, 56, 2])
-
-                repeated_subbox = center_target.view(-1,1,1,4).repeat(1, width, height, 1)  #torch.Size([1, 56, 56, 4])
-
-                p_x, p_y = repeated_points[:, :, :, 0], repeated_points[:, :, :, 1] #torch.Size([1, 56, 56])
+                p_y, p_x = repeated_points[:, :, :, 0], repeated_points[:, :, :, 1] #torch.Size([n_box, H, W])
 
                 sub_x1, sub_y1, sub_x2, sub_y2 = repeated_subbox[:, :, :, 0], repeated_subbox[:, :, :, 1], \
-                        repeated_subbox[:, :, :, 2], repeated_subbox[:, :, :, 3]    #torch.Size([1, 56, 56]),
+                        repeated_subbox[:, :, :, 2], repeated_subbox[:, :, :, 3]    #torch.Size([n_box, H, W]),
 
-                repeated_boxes = boxes.view(-1, 1, 1, 4).repeat(1, width, height, 1)    #torch.Size([1, 56, 56, 4])
+                repeated_boxes = boxes.view(-1, 1, 1, 4).repeat(1, height, width, 1)    #torch.Size([n_box, H, W, 4])
 
                 box_x1, box_y1, box_x2, box_y2 = repeated_boxes[:, :, :, 0], repeated_boxes[:, :, :, 1], \
-                        repeated_boxes[:, :, :, 2], repeated_boxes[:, :, :, 3]  #torch.Size([1, 56, 56])
+                        repeated_boxes[:, :, :, 2], repeated_boxes[:, :, :, 3]  #torch.Size([n_box, H, W])
 
-                l = (p_x - box_x1).unsqueeze(-1)    #torch.Size([1, 40, 56, 1])
-                t = (p_y - box_y1).unsqueeze(-1)    #torch.Size([1, 40, 56, 1])
-                r = (box_x2 - p_x).unsqueeze(-1)    #torch.Size([1, 40, 56, 1])
-                b = (box_y2 - p_y).unsqueeze(-1)    #torch.Size([1, 40, 56, 1])
-
-                max_dist = torch.max(torch.cat((l, t, r, b), dim=-1), dim=-1)[0]    #torch.Size([1, 40, 56])
-                # point shld satisy 3 conditions: , ,
+                l = p_x - box_x1
+                t = p_y - box_y1
+                r = box_x2 - p_x
+                b = box_y2 - p_y
+                unsqueeze = lambda x: x.unsqueeze(-1)
+                left, top, right, bottom = list(map(unsqueeze, [l,t,r,b])) # torch.Size([n_box, H, W, 1])
+                max_dist = torch.max(torch.cat((left, top, right, bottom), dim=-1), dim=-1)[0]    #torch.Size([n_box, H, W])
+                
+                # point shld satisy 3 conditions
                 cond_1 = (p_x >= sub_x1) & (p_x <= sub_x2) & (p_y >= sub_y1) & (p_y <= sub_y2)  # point in subbox
                 cond_2 = (p_x >= box_x1) & (p_x <= box_x2) & (p_y >= box_y1) & (p_y <= box_y2)  # point in box
-                cond_3 = (max_dist >= l_reg_range[0]) & (max_dist <= l_reg_range[1])                   # max_dist within l_reg_range
+                cond_3 = (max_dist > l_reg_range[0]) & (max_dist < l_reg_range[1])                   # max_dist within l_reg_range
 
-                mask = torch.where(cond_1 & cond_2 & cond_3, True, False)       # mask where all 3 cond satisfied
-                forg_mask = torch.any(mask, dim=0)      #torch.Size([40, 56])
-                back_mask = ~forg_mask                  #torch.Size([40, 56])
+                mask = torch.where(cond_1 & cond_2 & cond_3, True, False)  # mask where all 3 cond satisfied   torch.Size([n_box, H, W])
+                forg_mask = torch.any(mask, dim=0)      #torch.Size([H, W])
+                back_mask = ~forg_mask                  #torch.Size([H, W])
 
                 n_forg_points = forg_mask.sum().detach()
                 pos_samples += n_forg_points
 
-                area_point = mask * areas[:, None, None]        #torch.Size([1, 40, 56])
+                area_point = mask * areas[:, None, None]        #torch.Size([n_box, H, W])
                 area_point[~mask] = 1e8        # something big!!
-                box_point = torch.min(area_point, dim=0)[1]     #torch.Size([40, 56])
+                box_point = torch.min(area_point, dim=0)[1]     #torch.Size([H, W])
                 box_point[back_mask] = -1
 
-                label_point = labels[box_point[forg_mask]]
-
-                class_point = box_point.unsqueeze(dim=-1).repeat(1, 1, self.num_classes)    #torch.Size([40, 56, 20])
+                label_point = labels[box_point[forg_mask]]    #torch.Size([n_box]) - range (0-19)
+                
+                class_point = box_point.unsqueeze(dim=-1).repeat(1, 1, self.num_classes)    #torch.Size([H, W, n_class])
                 class_point[back_mask] = 0
-                class_point[forg_mask] = F.one_hot(label_point, num_classes=self.num_classes)
+                class_point[forg_mask] = F.one_hot(label_point, num_classes=self.num_classes)          
                 class_point.detach()
 
-
-                losses["cls_loss"].append(sigmoid_focal_loss(l_cls_point.view(width, height, self.num_classes), class_point, reduction="sum"))
-
-                if not n_forg_points:       # continue if there is no forgreout points!
-                    continue
-
-                l_reg_point = l_reg_point.view(width, height, 4)
+                losses["cls_loss"].append(sigmoid_focal_loss(l_cls_point.view(height, width, self.num_classes), class_point, alpha=0.25, reduction="sum"))
+    
+                l_reg_point = l_reg_point.view(height, width, 4)
                 pred_l, pred_t, pred_r, pred_b = l_reg_point[forg_mask][:, 0], l_reg_point[forg_mask][:, 1], \
                                                     l_reg_point[forg_mask][:, 2], l_reg_point[forg_mask][:, 3]
 
-                forg_x, forg_y = l_points[forg_mask][:, 0], l_points[forg_mask][:, 1]
+                forg_y, forg_x = l_points[forg_mask][:, 0], l_points[forg_mask][:, 1]
 
                 pred_x1, pred_y1 = (forg_x - pred_l * l_stride), (forg_y - pred_t * l_stride)
                 pred_x2, pred_y2 = (forg_x + pred_r * l_stride), (forg_y + pred_b * l_stride)
-                pred_xy = torch.stack((pred_x1, pred_y1, pred_x2, pred_y2), dim=1)
+                pred_xy = torch.stack((pred_x1, pred_y1, pred_x2, pred_y2), dim=1)      
                 target_xy = torch.zeros((*box_point.shape, 4), device = self.device)
-                target_xy = target_xy[forg_mask].detach()
-  
+                target_xy[forg_mask] = boxes[box_point[forg_mask]]          # @TODO: try divding with lstride?
+                target_xy = target_xy[forg_mask].detach()                               
+                # @TODO: Add learnable scalar here as mentioned in paper?
                 losses["reg_loss"].append(giou_loss(pred_xy, target_xy, reduction="sum"))
                 box_forg_point = box_point[forg_mask].view(-1, 1)
 
-                l_forg = l.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
-                t_forg = t.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
-                r_forg = r.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
-                b_forg = b.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
+                l_forg = left.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
+                t_forg = top.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
+                r_forg = right.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
+                b_forg = bottom.squeeze(-1).permute(1,2,0)[forg_mask].gather(1, box_forg_point)
 
                 target_center = torch.sqrt(
-                    (torch.min(l_forg, r_forg) * torch.min(t_forg, b_forg)) /
-                    (torch.max(l_forg, r_forg) * torch.max(t_forg, b_forg))
-                ).detach()
-                pred_center = l_ctr_point.view(width, height, 1)[forg_mask]
+                    (torch.min(l_forg, r_forg) / torch.max(l_forg, r_forg)) *
+                    (torch.min(t_forg, b_forg) / torch.max(t_forg, b_forg))
+                ).detach()        
+
+                pred_center = l_ctr_point.view(height, width, 1)[forg_mask]
+
                 losses["ctr_loss"].append(F.binary_cross_entropy_with_logits(pred_center, target_center, reduction="sum"))
-  
+
+        # To ensure non-zero divison (worst case when no forg points)
         pos_samples = max(1, pos_samples)
+        
         losses["cls_loss"] = torch.sum(sum(losses["cls_loss"])) / pos_samples
         losses["reg_loss"] = lambda_reg * torch.sum(sum(losses["reg_loss"])) / pos_samples
         losses["ctr_loss"] = torch.sum(sum(losses["ctr_loss"])) / pos_samples

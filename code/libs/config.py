@@ -55,6 +55,7 @@ DEFAULTS = {
         # radius used for center sampling during training
         "center_sampling_radius": 1.5,
         # additional params can be added here
+        "devices": ["cuda:0"]
     },
     "test_cfg": {
         # score threshold for postprocessing
