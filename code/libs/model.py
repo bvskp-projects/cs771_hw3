@@ -21,6 +21,8 @@ from .transforms import GeneralizedRCNNTransform
 # loss functions
 from .losses import sigmoid_focal_loss, giou_loss
 
+from copy import deepcopy
+
 
 class FCOSClassificationHead(nn.Module):
     """
@@ -261,10 +263,18 @@ class FCOS(nn.Module):
         self.cls_head = FCOSClassificationHead(fpn_feats_dim, num_classes)
         self.reg_head = FCOSRegressionHead(fpn_feats_dim)
 
-        # image batching, normalization, resizing, and postprocessing
-        self.transform = GeneralizedRCNNTransform(
-            img_min_size, img_max_size, img_mean, img_std
+        # Use all min sizes during inference time if test time
+        # augmentation is enabled
+        # Achieved by defining one transform per min_size
+        self.transforms = self.get_test_transforms(
+            img_min_size,
+            img_max_size,
+            img_mean,
+            img_std,
+            test_cfg,
         )
+        for i in range(len(self.transforms)):
+            setattr(self, f'x{i}', self.transforms[i])
 
         # other params for training / inference
         self.center_sampling_radius = train_cfg["center_sampling_radius"]
@@ -273,6 +283,47 @@ class FCOS(nn.Module):
         self.detections_per_img = test_cfg["detections_per_img"]
         self.topk_candidates = test_cfg["topk_candidates"]
         self.device = torch.device(train_cfg.get("devices", ["cpu"])[0])
+
+
+    """
+    Generate a list of transforms, one for each minimum size
+    """
+    def get_test_transforms(
+        self,
+        img_min_size,
+        img_max_size,
+        img_mean,
+        img_std,
+        test_cfg,
+    ):
+        if not test_cfg["augment"]:
+            print(self.training, test_cfg["augment"])
+            return [GeneralizedRCNNTransform(
+                deepcopy(img_min_size),
+                deepcopy(img_max_size),
+                deepcopy(img_mean),
+                deepcopy(img_std),
+            )]
+
+        if (not isinstance(img_min_size, list) and
+            not isinstance(img_min_size, tuple)):
+            return [GeneralizedRCNNTransform(
+                deepcopy(img_min_size),
+                deepcopy(img_max_size),
+                deepcopy(img_mean),
+                deepcopy(img_std)
+            )]
+        
+        transforms_ = list()
+        for min_size in img_min_size:
+            transforms_.append(GeneralizedRCNNTransform(
+                [deepcopy(min_size)],
+                deepcopy(img_max_size),
+                deepcopy(img_mean),
+                deepcopy(img_std)
+            ))
+        return transforms_
+
 
     """
     We will overwrite the train function. This allows us to always freeze
@@ -341,47 +392,84 @@ class FCOS(nn.Module):
             val = img.shape[-2:]
             original_image_sizes.append((val[0], val[1]))
 
-        # transform the input
-        images, targets = self.transform(images, targets)
+        per_scale_detections = list()
+        images_, targets_ = images, targets
+        for transform in self.transforms:
+            # transform the input
+            # images, targets = transform(images_, targets_)
+            images, targets = transform(images_, targets_)
 
-        # get the features from the backbone
-        # the result will be a dictionary {feature name : tensor}
-        features = self.backbone(images.tensors)
+            # get the features from the backbone
+            # the result will be a dictionary {feature name : tensor}
+            features = self.backbone(images.tensors)
 
-        # send the features from the backbone into the FPN
-        # the result is converted into a list of tensors (list length = #FPN levels)
-        # this list stores features in increasing depth order, each of size N x C x H x W
-        # (N: batch size, C: feature channel, H, W: height and width)
-        fpn_features = self.fpn(features)
-        fpn_features = list(fpn_features.values())
+            # send the features from the backbone into the FPN
+            # the result is converted into a list of tensors (list length = #FPN levels)
+            # this list stores features in increasing depth order, each of size N x C x H x W
+            # (N: batch size, C: feature channel, H, W: height and width)
+            fpn_features = self.fpn(features)
+            fpn_features = list(fpn_features.values())
 
-        # classification / regression heads
-        cls_logits = self.cls_head(fpn_features)
-        reg_outputs, ctr_logits = self.reg_head(fpn_features)
+            # classification / regression heads
+            cls_logits = self.cls_head(fpn_features)
+            reg_outputs, ctr_logits = self.reg_head(fpn_features)
 
-        # 2D points (corresponding to feature locations) of shape H x W x 2
-        points, strides, reg_range = self.point_generator(fpn_features)
+            # 2D points (corresponding to feature locations) of shape H x W x 2
+            points, strides, reg_range = self.point_generator(fpn_features)
 
-        # training / inference
-        if self.training:
-            # training: generate GT labels, and compute the loss
-            losses = self.compute_loss(
-                targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
-            )
-            # return loss during training
-            return losses
+            # training / inference
+            if self.training:
+                # training: generate GT labels, and compute the loss
+                losses = self.compute_loss(
+                    targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
+                )
+                # return loss during training
+                return losses
 
-        else:
-            # inference: decode / postprocess the boxes
-            detections = self.inference(
-                points, strides, cls_logits, reg_outputs, ctr_logits, images.image_sizes
-            )
-            # rescale the boxes to the input image resolution
-            detections = self.transform.postprocess(
-                detections, images.image_sizes, original_image_sizes
-            )
-            # return detectrion results during inference
-            return detections
+            else:
+                # inference: decode / postprocess the boxes
+                detections = self.inference(
+                    points, strides, cls_logits, reg_outputs, ctr_logits, images.image_sizes
+                )
+                # rescale the boxes to the input image resolution
+                detections = transform.postprocess(
+                    detections, images.image_sizes, original_image_sizes
+                )
+                if len(self.transforms) == 1:
+                    return detections
+                # Add detections for this particular scale
+                per_scale_detections.append(detections)
+        detections = self.collapse_detections(per_scale_detections)
+        # return detectrion results during inference
+        return detections
+
+
+    """
+    Given postprocessed detections,
+    run non-maximum suppression on transforms belonging to the same image.
+
+    Return per image detections.
+    """
+    def collapse_detections(self, detections):
+        collapsed_detections = list()
+        per_img_detections = [list(row) for row in zip(*detections)]
+        for per_scale_detections in per_img_detections:
+            atts = lambda att: [det[att] for det in per_scale_detections]
+            l_boxes = torch.cat(atts("boxes"))
+            l_scores = torch.cat(atts("scores"))
+            l_labels = torch.cat(atts("labels")) - 1
+            toKeep = batched_nms(
+                l_boxes, l_scores, l_labels, self.nms_thresh)
+            toKeep = toKeep[:self.detections_per_img]
+
+            collapsed_detections.append({
+                "boxes": l_boxes[toKeep],
+                "scores": l_scores[toKeep],
+                "labels": l_labels[toKeep] + 1,
+            })
+
+        return collapsed_detections
+
 
     """
     Fill in the missing code here. This is probably the most tricky part
