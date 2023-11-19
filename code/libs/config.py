@@ -67,6 +67,8 @@ DEFAULTS = {
         # maximum number of boxes per pyramid level (before NMS)
         "topk_candidates": 1000,
         # additional params can be added here
+        # Whether we should use test time data augmentation
+        "augment": False,
     },
     # optimizer (for training)
     "opt": {
