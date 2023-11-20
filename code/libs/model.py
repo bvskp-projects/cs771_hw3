@@ -575,6 +575,9 @@ class FCOS(nn.Module):
                 class_point.detach()
 
                 losses["cls_loss"].append(sigmoid_focal_loss(l_cls_point.view(height, width, self.num_classes), class_point, alpha=0.25, reduction="sum"))
+
+                if not n_forg_points:
+                    continue
     
                 l_reg_point = l_reg_point.view(height, width, 4)
                 pred_l, pred_t, pred_r, pred_b = l_reg_point[forg_mask][:, 0], l_reg_point[forg_mask][:, 1], \
@@ -586,9 +589,8 @@ class FCOS(nn.Module):
                 pred_x2, pred_y2 = (forg_x + pred_r * l_stride), (forg_y + pred_b * l_stride)
                 pred_xy = torch.stack((pred_x1, pred_y1, pred_x2, pred_y2), dim=1)      
                 target_xy = torch.zeros((*box_point.shape, 4), device = self.device)
-                target_xy[forg_mask] = boxes[box_point[forg_mask]]          # @TODO: try divding with lstride?
+                target_xy[forg_mask] = boxes[box_point[forg_mask]]
                 target_xy = target_xy[forg_mask].detach()                               
-                # @TODO: Add learnable scalar here as mentioned in paper?
                 losses["reg_loss"].append(giou_loss(pred_xy, target_xy, reduction="sum"))
                 box_forg_point = box_point[forg_mask].view(-1, 1)
 
