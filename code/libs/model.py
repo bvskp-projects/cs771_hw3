@@ -297,7 +297,6 @@ class FCOS(nn.Module):
         test_cfg,
     ):
         if not test_cfg["augment"]:
-            print(self.training, test_cfg["augment"])
             return [GeneralizedRCNNTransform(
                 deepcopy(img_min_size),
                 deepcopy(img_max_size),
