@@ -2,10 +2,12 @@ output_folder: "../logs"
 dataset:
   img_folder: "../data/VOCdevkit/VOC2007/JPEGImages"
   json_folder: "../data"
-
-# other parameters can be specified in this yaml file
-# e.g. the following lines will reset the number of training epochs to 8
-#opt:
-#  epochs: 8
-
-# see config.py for more details
+input:
+  img_min_size: [288, 320, 352, 384, 416, 448, 480]
+  img_max_size: 640
+model:
+  fpn_feats_dim: 128
+opt:
+  # 1x schedule: mAP@IoU=0.5 ~61
+  epochs: 50
+  learing_rate: 0.0025
